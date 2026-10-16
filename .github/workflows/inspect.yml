@@ -1,0 +1,411 @@
+name: Inspect the sheet
+
+# Diagnostics. Nothing here calls Guesty, so no token is spent and the daily quota
+# is untouched. Everything is read-only EXCEPT bad_units with `write` ticked, which
+# rewrites the Property cell of rows carrying an invented unit number -- that one
+# column, on those rows, and nothing else.
+#
+# Exists because these scripts need the Sheets service-account key, which lives in
+# Actions secrets and not on anyone's laptop.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: "What to look at"
+        required: true
+        default: stale_moves
+        type: choice
+        options:
+          - stale_moves       # struck rows whose booking is still live elsewhere
+          - bad_units         # rows named with an invented unit (427 Pembrook 002)
+          - glenmoor       # backfill the 1401 Glenmoor merge onto old rows
+          - date_rows         # every row the sheet holds for one date
+          - connecteam        # PREVIEW the Connecteam jobs for one city (never writes)
+          - board             # READ what is already on the Connecteam boards
+          - schedulers        # LIST every Connecteam board on the account
+          - job_match         # can each property be matched to a Connecteam Job?
+          - market_ready      # size and Job coverage per market and per board
+          - job_fields        # what a Job looks like; can we create one?
+          - color_palette    # which card colours Connecteam accepts
+          - calder        # which bookings are grey, and their codes (read-only)
+          - card_lookup      # which card belongs to a booking, and its ids
+          - map_audit        # does each booking's recorded card really belong to it?
+          - job_create        # CREATE the Jobs the TEST board is missing
+          - job_share        # can a Job be added to a second board? (our Job only)
+          - job_rename       # strip the Guesty V2 from Job names (ACCOUNT-WIDE)
+          - job_share_run    # ADD the test board to existing Jobs (reversible)
+          - shift_shape      # WRITES probe shifts to the TEST board to learn the API
+          - shift_update     # can a card's COLOUR be changed in place? (test board)
+          - board_peek       # every card on one board, by id (read-only)
+          - card_unpublish   # pull OUR cards back to DRAFT (needs write)
+          - shift_fields     # our card beside the team's, field by field
+          - shift_delete     # DELETES cards from one board (needs write)
+          - card_restore     # UNDO a push from its before-snapshot (needs write)
+          - card_paint       # set a TEST-board card's colour, to stage a proof
+          - why_missing       # why is one reservation not on the sheet?
+          - reservation_info  # everything known about one or more reservations
+          - duplicates        # rows sharing a (Property, Date)
+          - property_check    # pipeline vs sheet, for one property
+          - property_rows    # every sheet row for a property (no Guesty token)
+          - marks_audit       # does reading the marks see the whole tab?
+          - strike_snapshot   # every struck row, diffable
+          - strike_probe      # is the line on the whole row, or only part of it?
+          - filter_audit     # which rows a filter is hiding, per tab
+          - clear_filters    # REMOVES the filters that block the marks (needs write)
+          - restore_strikes  # re-strike rows repair_strikes lifted without evidence
+          - strike_write_test # WRITES to blank rows below the data, then clears them
+          - gcp_whoami       # which Google Cloud project this system runs in
+          - list_tabs         # every tab, its size and layout
+          - sheet_header     # the real columns and the letter each lives in
+      write:
+        description: "bad_units / stale_moves / strike_write_test: actually WRITE"
+        required: false
+        default: false
+        type: boolean
+      connecteam_write:
+        description: "connecteam ONLY: preview, or actually write TO THE TEST BOARD"
+        required: false
+        default: preview
+        type: choice
+        options:
+          - preview
+          - preview-test-board
+          - WRITE-TO-TEST-BOARD
+          - WRITE-TO-TEST-BOARD-DRAFT
+          - WRITE-TO-MARKET-BOARD-LIVE
+          - REMAP-ONLY
+          - REMAP-ONLY-WRITE
+      city:
+        description: "connecteam ONLY: which market to preview"
+        required: false
+        default: Austin
+        type: choice
+        options:
+          - Austin
+          - New Quintrell
+          - Net St. Louis
+          - Savannah
+          - Thunderbolt
+      start:
+        description: "connecteam: do not card anything before this date (YYYY-MM-DD). A floor, so it expires once reached."
+        required: false
+        default: ""
+        type: string
+      days:
+        description: "connecteam: rolling window depth in days (blank = 45). Use a small number for a cautious quillon push."
+        required: false
+        default: ""
+        type: string
+      month:
+        description: "connecteam month (YYYY-MM); strike_probe: tab name e.g. Octubre 2026"
+        required: false
+        default: ""
+        type: string
+      property:
+        description: "property_check: property name; strike_probe: grid rows e.g. 10,11,47,49"
+        required: false
+        default: ""
+        type: string
+      code:
+        description: "why_missing ONLY: the confirmation code to trace"
+        required: false
+        default: ""
+        type: string
+      from:
+        description: "board ONLY: range start (YYYY-MM-DD)"
+        required: false
+        default: ""
+        type: string
+      to:
+        description: "board ONLY: range end (YYYY-MM-DD)"
+        required: false
+        default: ""
+        type: string
+      date:
+        description: "date_rows ONLY: which date to dump (YYYY-MM-DD)"
+        required: false
+        default: ""
+        type: string
+      scope:
+        description: "months to check"
+        required: true
+        default: current-and-later
+        type: choice
+        options:
+          - current-and-later
+          - all
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements-sync.txt
+
+      - name: Run
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GUESTY_CLIENT_ID: ${{ secrets.GUESTY_CLIENT_ID }}
+          GUESTY_CLIENT_SECRET: ${{ secrets.GUESTY_CLIENT_SECRET }}
+          STATE_BUCKET: ${{ vars.STATE_BUCKET }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SYNC_LISTING_CITIES: ${{ vars.SYNC_LISTING_CITIES }}
+          CONNECTEAM_API_KEY: ${{ secrets.CONNECTEAM_API_KEY }}
+          WORKSHEET_NAME: ${{ vars.WORKSHEET_NAME }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.scope }}" = "all" ]; then ARGS="--all"; fi
+          case "${{ inputs.tool }}" in
+            stale_moves)
+              if [ "${{ inputs.write }}" = "true" ]; then ARGS="$ARGS --fix"; fi
+              python -u stale_moves.py $ARGS ;;
+            bad_units)
+              if [ "${{ inputs.write }}" = "true" ]; then ARGS="$ARGS --fix"; fi
+              python -u bad_units.py $ARGS ;;
+            glenmoor)
+              # One cell per row, the Property column, and nothing else.
+              # Matched on the Guesty LISTING ID, never on the name: 1409, 1413,
+              # 1417 and 1421 Glenm A/B are real separate flats in the same
+              # building and must not be merged with 1401.
+              if [ "${{ inputs.write }}" = "true" ]; then ARGS="$ARGS --fix"; fi
+              # `code` = "clear" repairs the 2026-10-07 off-by-one instead:
+              # puts FALSE back in the `assigned` checkboxes that got a property
+              # name written into them.
+              if [ "${{ inputs.code }}" = "clear" ]; then ARGS="$ARGS --clear-misplaced"; fi
+              python -u carondelet_merge.py $ARGS ;;
+            date_rows)   python -u date_rows.py --date "${{ inputs.date }}" ;;
+            connecteam)
+              MONTH=""
+              if [ -n "${{ inputs.month }}" ]; then MONTH="--month ${{ inputs.month }}"; fi
+              # A deliberately small quillon window, without a code edit. 45 days
+              # is ~67 Austin cards; 3 days is about five, which can be read at a
+              # glance and removed with one command.
+              DAYS=""
+              if [ -n "${{ inputs.days }}" ]; then DAYS="--days ${{ inputs.days }}"; fi
+              if [ -n "${{ inputs.start }}" ]; then DAYS="$DAYS --start ${{ inputs.start }}"; fi
+              # Chris Test or nothing. Cards go to a market board only once Chris
+              # has signed off, and that sign-off is a code change, not an input
+              # here: connecteam_push refuses --live without --test.
+              #
+              # This option briefly existed on 2026-09-21 and 38 cards reached
+              # the Austin board. They were deleted the same day. The lesson is
+              # in the shape of the guard, not in a comment: there is no
+              # board, and the script refused it regardless.
+              #
+              # Since 2026-10-07 there IS such an option, because Chris signed
+              # Austin off. What protects the rest is unchanged and is not here:
+              # connecteam_push refuses any city not named in
+              # connecteam_map.LIVE_MARKETS, so this input cannot grant what the
+              # code withholds. That is the right place for the rule -- an option
+              # is one dispatch away from being picked, a named set is an edit.
+              if [ "${{ inputs.connecteam_write }}" = "REMAP-ONLY" ]; then
+                # Rebuild the code-to-card map and report it. Writes nothing at
+                # all -- not the map, not a card.
+                python -u connecteam_push.py --city "${{ inputs.city }}" $MONTH $DAYS --remap-only
+              elif [ "${{ inputs.connecteam_write }}" = "REMAP-ONLY-WRITE" ]; then
+                # Same, but store the rebuilt map. Still touches NO card.
+                echo "::warning::Rewriting the card map for ${{ inputs.city }}. No card is changed."
+                python -u connecteam_push.py --city "${{ inputs.city }}" $MONTH $DAYS --remap-only --live
+              elif [ "${{ inputs.connecteam_write }}" = "WRITE-TO-MARKET-BOARD-LIVE" ]; then
+                # No apostrophe. An escaped one here broke the whole shell
+                # block on 2026-10-07 -- the generated script failed to parse
+                # before any Python ran -- and it is not worth a possessive.
+                echo "::warning::Writing to the OWN board for ${{ inputs.city }}. Crews see this."
+                python -u connecteam_push.py --city "${{ inputs.city }}" $MONTH $DAYS --live
+              elif [ "${{ inputs.connecteam_write }}" = "WRITE-TO-TEST-BOARD-DRAFT" ]; then
+                # Cards land in the DRAFT layer, isPublished false, so nobody on
+                # a crew sees them until somebody publishes them deliberately.
+                # This is how the client actually works: pull a week out of the
+                # draft, assign it, publish it.
+                echo "::warning::Writing DRAFT cards to the TEST board (Chris Test). Nothing is published."
+                python -u connecteam_push.py --city "${{ inputs.city }}" $MONTH $DAYS --test --live --draft
+              elif [ "${{ inputs.connecteam_write }}" = "WRITE-TO-TEST-BOARD" ]; then
+                echo "::warning::Writing to the TEST board (Chris Test)."
+                python -u connecteam_push.py --city "${{ inputs.city }}" $MONTH $DAYS --test --live
+              elif [ "${{ inputs.connecteam_write }}" = "preview-test-board" ]; then
+                # Preview against Chris Test rather than the market board. The
+                # two resolve DIFFERENT Jobs -- Austin owns 35, Chris Test 3 --
+                # so previewing the market board says nothing about what would
+                # land on the test one.
+                python -u connecteam_push.py --city "${{ inputs.city }}" $MONTH $DAYS --test
+              else
+                python -u connecteam_push.py --city "${{ inputs.city }}" $MONTH $DAYS
+              fi ;;
+            schedulers)  python -u connecteam_board.py --schedulers ;;
+            map_audit)
+              python -u map_audit.py --city "${{ inputs.city }}" ;;
+            card_lookup)
+              # `code` is a confirmation code; `property` a property name.
+              ARGS3=""
+              if [ -n "${{ inputs.code }}" ]; then ARGS3="--code ${{ inputs.code }}"; fi
+              if [ -n "${{ inputs.property }}" ]; then ARGS3="$ARGS3 --property \"${{ inputs.property }}\""; fi
+              eval python -u card_lookup.py $ARGS3 ;;
+            calder)
+              # `from` doubles as the start floor here.
+              START=""
+              if [ -n "${{ inputs.from }}" ]; then START="--start ${{ inputs.from }}"; fi
+              python -u cancelled_cards.py --city "${{ inputs.city }}" $START ;;
+            color_palette) python -u color_palette.py ;;
+            market_ready)
+              MONTH=""
+              if [ -n "${{ inputs.month }}" ]; then MONTH="--month ${{ inputs.month }}"; fi
+              python -u market_readiness.py $MONTH ;;
+            job_share_run)
+              MONTH=""
+              if [ -n "${{ inputs.month }}" ]; then MONTH="--month ${{ inputs.month }}"; fi
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              # `code` = "revert" takes the test board back off again;
+              # `from` optionally limits how many are touched.
+              EXTRA=""
+              if [ "${{ inputs.code }}" = "revert" ]; then EXTRA="--revert"; fi
+              if [ -n "${{ inputs.from }}" ]; then EXTRA="$EXTRA --limit ${{ inputs.from }}"; fi
+              # `property` may name the board to share ONTO. Sharing adds a
+              # board to a Job's instanceIds and removes none -- it makes the
+              # property pickable there and puts no card on anybody's schedule.
+              BOARD=""
+              if [ -n "${{ inputs.property }}" ]; then BOARD="--board ${{ inputs.property }} --market-board"; fi
+              python -u job_share.py --city "${{ inputs.city }}" $MONTH $BOARD $EXTRA $CONFIRM ;;
+            job_rename)
+              # `property` is the board whose Jobs to list. The RENAME itself is
+              # account-wide -- a Job is one record with a list of boards -- so
+              # this cannot be trialled on one board and judged there.
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              python -u job_rename.py --board "${{ inputs.property }}" $CONFIRM ;;
+            job_share)
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              python -u job_share_probe.py $CONFIRM ;;
+            job_create)
+              MONTH=""
+              if [ -n "${{ inputs.month }}" ]; then MONTH="--month ${{ inputs.month }}"; fi
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              # `property` may name a board. Creating a Job there is a PROPERTY
+              # record, not a card -- cards stay locked to the test board.
+              BOARD=""
+              if [ -n "${{ inputs.property }}" ]; then BOARD="--board ${{ inputs.property }} --market-board"; fi
+              python -u job_create.py --city "${{ inputs.city }}" $MONTH $BOARD $CONFIRM ;;
+            job_fields)
+              CREATE=""
+              if [ "${{ inputs.write }}" = "true" ]; then CREATE="--create"; fi
+              python -u job_fields.py $CREATE ;;
+            card_restore)
+              # `property` is the board; `code` optionally names an older
+              # snapshot instead of this board's latest.
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              SNAP=""
+              if [ -n "${{ inputs.code }}" ]; then SNAP="--snapshot ${{ inputs.code }}"; fi
+              python -u card_restore.py --board "${{ inputs.property }}" $SNAP $CONFIRM ;;
+            card_paint)
+              # `code` is the colour; from/to the window; `to_prop` unused.
+              # Test board only -- the tool has no --board at all.
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              python -u card_paint.py --from "${{ inputs.from }}" --to "${{ inputs.to }}" --color "${{ inputs.code }}" $CONFIRM ;;
+            shift_update) python -u shift_update_probe.py ;;
+            shift_delete)
+              # `property` is the board id; from/to bound the window;
+              # `code` optionally narrows to titles containing it.
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              TITLE=""
+              if [ -n "${{ inputs.code }}" ]; then TITLE="--title-contains ${{ inputs.code }}"; fi
+              # `date` carries a comma-separated id list here, for removing the
+              # exact cards board_watch names rather than a whole window.
+              IDS=""
+              if [ -n "${{ inputs.date }}" ]; then IDS="--ids ${{ inputs.date }}"; fi
+              python -u shift_delete.py --board "${{ inputs.property }}" --from "${{ inputs.from }}" --to "${{ inputs.to }}" $TITLE $IDS $CONFIRM ;;
+            card_unpublish)
+              # `property` is the board id; from/to bound the window; `date`
+              # takes a comma-separated id list; `days` doubles as --limit, so
+              # a one-card probe needs no code change.
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              IDS=""
+              if [ -n "${{ inputs.date }}" ]; then IDS="--ids ${{ inputs.date }}"; fi
+              LIM=""
+              if [ -n "${{ inputs.days }}" ]; then LIM="--limit ${{ inputs.days }}"; fi
+              python -u card_unpublish.py --board "${{ inputs.property }}" --from "${{ inputs.from }}" --to "${{ inputs.to }}" $IDS $LIM $CONFIRM ;;
+            board_peek)
+              # `property` carries the board id; from/to bound the window.
+              python -u board_peek.py --board "${{ inputs.property }}" --from "${{ inputs.from }}" --to "${{ inputs.to }}" ;;
+            shift_fields)
+              # `property` is the board id; from/to bound OUR cards.
+              # The team's own cards are read from the month before.
+              python -u shift_fields.py --board "${{ inputs.property }}" --mine "${{ inputs.from }}" "${{ inputs.to }}" --theirs 2026-09-01 2026-10-01 ;;
+            job_match)
+              MONTH=""
+              if [ -n "${{ inputs.month }}" ]; then MONTH="--month ${{ inputs.month }}"; fi
+              python -u job_match.py --city "${{ inputs.city }}" $MONTH ;;
+            shift_shape)
+              # Test board only -- the script verifies the id against the
+              # account and has no path to a market board.
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              python -u shift_shape_probe.py $CONFIRM ;;
+            why_missing) python -u find_reservation.py --code "${{ inputs.code }}" ;;
+            reservation_info)
+              # `code` takes a comma-separated list. Read-only.
+              python -u reservation_info.py --codes "${{ inputs.code }}" ;;
+            property_check) python -u property_check.py --property "${{ inputs.property }}" ;;
+            property_rows) python -u property_rows.py --like "${{ inputs.property }}" ;;
+            marks_audit) python -u marks_audit.py ;;
+            strike_snapshot) python -u strike_snapshot.py ;;
+            filter_audit) python -u filter_audit.py --rows "${{ inputs.property }}" ;;
+            clear_filters)
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              python -u clear_filters.py $CONFIRM ;;
+            restore_strikes)
+              TAB="${{ inputs.month }}"
+              if [ -z "$TAB" ]; then TAB="Septiembre 2026"; fi
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              # `code` carries the comma-separated list. Guesty is asked
+              # about each one; only those it calls calder are struck.
+              python -u restore_strikes.py --tab "$TAB" --codes "${{ inputs.code }}" $CONFIRM ;;
+            strike_probe)
+              TAB="${{ inputs.month }}"
+              if [ -z "$TAB" ]; then TAB="Octubre 2026"; fi
+              python -u strike_probe.py --tab "$TAB" --rows "${{ inputs.property }}" ;;
+            strike_write_test)
+              TAB="${{ inputs.month }}"
+              if [ -z "$TAB" ]; then TAB="Octubre 2026"; fi
+              # Only ever the scratch band: the script verifies every target
+              # row is blank and below the last data row, and clears them again.
+              CONFIRM=""
+              if [ "${{ inputs.write }}" = "true" ]; then CONFIRM="--confirm"; fi
+              # The sequence variant writes VALUES to the same blank band
+              # quillon, the way the sync does, then paints. Both are cleared.
+              SEQ=""
+              if [ "${{ inputs.connecteam_write }}" = "WRITE-TO-TEST-BOARD" ]; then SEQ="--sequence"; fi
+              ROWS=""
+              if [ -n "${{ inputs.property }}" ]; then ROWS="--rows ${{ inputs.property }}"; fi
+              python -u strike_write_test.py --tab "$TAB" $CONFIRM $SEQ $ROWS ;;
+            duplicates)
+              ARGS2=""
+              if [ "${{ inputs.scope }}" = "all" ]; then ARGS2="--all"; fi
+              # `property` doubles as --show here: how many slots to list per tab
+              # before truncating. The default of 12 hides conflicts further down.
+              if [ -n "${{ inputs.property }}" ]; then ARGS2="$ARGS2 --show ${{ inputs.property }}"; fi
+              python -u duplicates.py $ARGS2 ;;
+            board)
+              # GETs only. connecteam_board.py contains no write path at all.
+              CITY=""
+              if [ -n "${{ inputs.city }}" ]; then CITY="--city ${{ inputs.city }}"; fi
+              python -u connecteam_board.py --from "${{ inputs.from }}" --to "${{ inputs.to }}" --keys --jobs --envelope ;;
+            sheet_header)
+              # `month` is the tab title; `code` a comma-separated list of
+              # grid rows to dump verbatim.
+              python -u sheet_header.py --tab "${{ inputs.month }}" --rows "${{ inputs.code }}" ;;
+            gcp_whoami)  python -u gcp_whoami.py ;;
+            *)           python -u list_tabs.py ;;
+          esac

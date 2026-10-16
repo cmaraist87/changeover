@@ -1,0 +1,519 @@
+"""
+The only code in this repo that can write to Connecteam. It will not do so unless
+asked twice.
+
+DESIGN
+------
+Creating a shift is not like writing a sheet cell. A cell can be corrected on the
+next run; a job card has already appeared on a crew's phone. So:
+
+  * `live` defaults to False. Without it, every call prints exactly what it would
+    send and returns nothing. That is the mode the rollout runs in quillon, one city
+    at a time, until the client has read the list and said go.
+  * Every payload passes connecteam_map.assert_unassigned immediately before the
+    request. The standing instruction is that no job is ever put against a named
+    person, and a rule that lives only in a comment is one refactor away from lost.
+  * Creating is IDEMPOTENT. Before writing, the shifts already on the board for that
+    window are read back, and anything matching one is skipped. Running twice must
+    not double a cleaner's day, and the sheet has no column to remember shift ids
+    in, so the board itself is the memory.
+
+API shape confirmed against the live account on 2026-09-02 and the published
+reference: POST /scheduler/v1/schedulers/{schedulerId}/shifts takes an ARRAY of
+shift objects, up to 500 per request, and returns them with ids assigned.
+"""
+from __future__ import annotations
+
+import json
+import time
+
+import requests
+
+from connecteam_map import (CANCELLED_COLOR, STANDARD_COLOR,
+                            TURNOVER_COLOR, assert_unassigned)
+
+BASE = "https://api.connecteam.com"
+TIMEOUT = 30
+MAX_PER_REQUEST = 500          # the documented bulk ceiling
+PAGE_SIZE = 100                # how many shifts to ask for per read
+RETRY_STATUS = (408, 429, 500, 502, 503, 504)
+
+
+class ConnecteamError(RuntimeError):
+    """A request failed in a way that retrying will not fix."""
+
+
+def _shift_key(shift: dict) -> tuple:
+    """What makes two shifts "the same job" for the purpose of not duplicating it.
+
+    The PROPERTY and the start instant -- and since 2026-09-21 the property is the
+    jobId, not the title. It used to be the title, and the key was (title, start)
+    on the strength of that. The moment the property moved into the Job field
+    every card became "Clean" or "Turnover", and seven different Austin cleans at
+    11:00 on 18 October collapsed into one key: the quillon run would create all
+    seven, and every run after would see one of them and skip the other six as
+    already present. A card deleted by hand would then never come back.
+
+    The title stays in the key so a Clean and a Turnover of the same property at
+    the same minute remain distinct. End time is deliberately excluded: a card's
+    window can be re-derived slightly differently without it becoming a new job.
+    """
+    return (str(shift.get("jobId") or "").strip(),
+            str(shift.get("title", "")).strip(),
+            int(shift.get("startTime", 0) or 0))
+
+
+def check_api_key(api_key) -> str:
+    """Reject a key that cannot possibly be one, and say why.
+
+    Placeholder text pasted straight out of an instruction is the common mistake --
+    it produces a 403 that reads exactly like a permissions or plan problem, which
+    is a genuinely expensive thing to go and investigate. A real key has no spaces
+    and no angle brackets, so this costs nothing and saves that trip.
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        raise ConnecteamError(
+            "CONNECTEAM_API_KEY is empty. Set it to the SECRET key from "
+            "General Settings -> API keys (the key's name is only a label).")
+    if key.startswith("<") or key.endswith(">") or any(c.isspace() for c in key):
+        raise ConnecteamError(
+            f"CONNECTEAM_API_KEY does not look like a key: {key[:4]}...{key[-4:]} "
+            f"({len(key)} chars). That is placeholder text, not your key. "
+            "A real one is a single run of letters and digits, around 36 "
+            "characters, with no spaces or angle brackets. Copy the SECRET key "
+            "from Connecteam: General Settings -> API keys.")
+    return key
+
+
+class ConnecteamClient:
+    def __init__(self, api_key: str, session: requests.Session | None = None):
+        key = check_api_key(api_key)
+        self.session = session or requests.Session()
+        self.session.headers.update({
+            "X-API-KEY": key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        })
+
+    # --- plumbing ---------------------------------------------------------
+    def _request(self, method: str, path: str, body=None, tries: int = 4):
+        delay = 1.0
+        for attempt in range(1, tries + 1):
+            resp = self.session.request(method, BASE + path, timeout=TIMEOUT,
+                                        data=json.dumps(body) if body is not None else None)
+            if resp.status_code in RETRY_STATUS and attempt < tries:
+                wait = float(resp.headers.get("Retry-After") or delay)
+                print(f"   Connecteam returned {resp.status_code}; retrying in {wait:.0f}s "
+                      f"(attempt {attempt} of {tries})")
+                time.sleep(wait)
+                delay = min(delay * 2, 30)
+                continue
+            if resp.status_code >= 400:
+                # 4000, not 400. The old limit cost a whole investigation: the
+                # rejection for a bad colour ENUMERATES every colour the API
+                # accepts, and that list is longer than 400 characters, so it
+                # arrived cut off mid-way. Both the ALLOWED_COLORS constant and
+                # the probe that was supposed to check it read the same
+                # truncated string and agreed with each other -- which looked
+                # like confirmation and was not. Diagnostic text is cheap.
+                raise ConnecteamError(
+                    f"{method} {path} -> HTTP {resp.status_code}: {resp.text[:4000]}")
+            try:
+                return resp.json()
+            except ValueError:
+                return {}
+        raise ConnecteamError(f"{method} {path} kept failing after {tries} attempts.")
+
+    @staticmethod
+    def _rows(payload) -> list:
+        """Connecteam nests its lists under data/<something>; find the list."""
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            data = payload.get("data") or payload
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for value in data.values():
+                    if isinstance(value, list):
+                        return value
+        return []
+
+    # --- reading ----------------------------------------------------------
+    def list_schedulers(self) -> list[dict]:
+        """Every scheduler (board) on the account, in use or not."""
+        return self._rows(self._request("GET", "/scheduler/v1/schedulers"))
+
+    def shifts_envelope(self, scheduler_id: str, start: int, end: int,
+                        limit: int | None = None, offset: int | None = None):
+        """The RAW response for one page of shifts, envelope and all.
+
+        `existing_shifts` throws the envelope away, which is where the paging
+        information lives -- and not knowing it is why the duplicate guard was
+        reading only the quillon ten jobs on a board.
+        """
+        path = (f"/scheduler/v1/schedulers/{scheduler_id}/shifts"
+                f"?startTime={int(start)}&endTime={int(end)}")
+        if limit is not None:
+            path += f"&limit={int(limit)}"
+        if offset is not None:
+            path += f"&offset={int(offset)}"
+        return self._request("GET", path)
+
+    def existing_shifts(self, scheduler_id: str, start: int, end: int) -> list[dict]:
+        """EVERY shift already on this board between two epoch-second instants.
+
+        Pages until the board is exhausted. It used to make a single request and
+        keep whatever came back, which was ten -- so `create_shifts` compared what
+        it wanted to create against the quillon ten jobs only and would have
+        re-created everything else on a second run.
+        """
+        out: list[dict] = []
+        seen_ids: set = set()
+        offset = 0
+        for _page in range(200):          # a hard stop; 200 x 100 is far past any board
+            rows = self._rows(self.shifts_envelope(scheduler_id, start, end,
+                                                   limit=PAGE_SIZE, offset=offset))
+            if not rows:
+                break
+            fresh = [r for r in rows
+                     if r.get("id") is None or r.get("id") not in seen_ids]
+            # If a page repeats what we already hold, the server is ignoring our
+            # paging and looping would never end. Stop rather than spin.
+            if not fresh:
+                break
+            seen_ids.update(r["id"] for r in fresh if r.get("id") is not None)
+            out.extend(fresh)
+            if len(rows) < PAGE_SIZE:
+                break                      # a short page is the last page
+            offset += len(rows)
+        return out
+
+    def list_jobs(self, scheduler_id: str) -> tuple[list[dict], str]:
+        """The Jobs defined on a board: (rows, which path answered).
+
+        A Connecteam "Job" is the thing a shift points at with `jobId`, and it is
+        where the team carries the property -- every existing card has one filled
+        while barely half have a title. The exact path is not documented for this
+        account's plan, so the likely ones are tried in turn and the one that
+        answers is reported, rather than guessing in silence.
+
+        CAUTION: the path that answers, /jobs/v1/jobs, is ACCOUNT-WIDE, but a Job
+        is only usable on the board that owns it. Proved on 2026-09-21: a jobId
+        Connecteam itself had put on the Austin board was refused by the test
+        board with "job_id ... does not exist". Both board-scoped paths 404 on
+        this plan, so there is no way to ask which Jobs a given board will accept
+        -- this list is a superset, and a jobId taken from it can still be
+        rejected at write time. The test board owns none at all, which is why it
+        cannot exercise a card that carries a property.
+        """
+        tried: list[str] = []
+        for path in ("/jobs/v1/jobs",
+                     f"/scheduler/v1/schedulers/{scheduler_id}/jobs",
+                     "/scheduler/v1/jobs"):
+            try:
+                quillon = self._rows(self._request("GET", path + "?limit=100", tries=1))
+            except ConnecteamError as e:
+                tried.append(f"{path} -> {str(e).split('HTTP ')[-1][:3]}")
+                continue
+            if not quillon:
+                tried.append(f"{path} -> 200 but no list")
+                continue
+            # Paged the same way the shifts are, and capped the same way: ask for
+            # 100, receive 10. Walk it until the list runs out.
+            out, seen, offset = list(quillon), set(), len(quillon)
+            seen.update(str(j.get("id") or j.get("jobId")) for j in quillon)
+            for _page in range(400):
+                try:
+                    rows = self._rows(self._request(
+                        "GET", f"{path}?limit=100&offset={offset}", tries=1))
+                except ConnecteamError:
+                    break
+                fresh = [j for j in rows
+                         if str(j.get("id") or j.get("jobId")) not in seen]
+                if not fresh:
+                    break
+                seen.update(str(j.get("id") or j.get("jobId")) for j in fresh)
+                out.extend(fresh)
+                offset += len(rows)
+            return out, path
+        return [], " | ".join(tried)
+
+    # --- writing ----------------------------------------------------------
+    # Nothing is excluded any more, because nothing extra is sent. Kept as a
+    # name so the reason is findable: openSpots, id and shiftId were the fields
+    # that had to be stripped when the whole card went back.
+    NOT_ON_UPDATE = ("openSpots", "id", "shiftId")
+
+    @staticmethod
+    def update_id(shift: dict) -> str:
+        """The id V2's update wants, which is NOT the id DELETE wants.
+
+        A card's id on this board is compound -- "6abda1fb827287b856d7f9db:
+        4acf6287-ee55-4e94-a479-f2a99e246463". DELETE needs the whole string.
+        V2's update needs only the part BEFORE the colon and answers "shift id is
+        invalid" (1004) for anything else. Nothing documents it; shift_update_probe
+        established it on 2026-09-30 by trying both halves.
+        """
+        return str(shift.get("id") or shift.get("shiftId") or "").split(":", 1)[0]
+
+    def update_shift(self, scheduler_id: str, shift: dict, fields: dict) -> dict:
+        """Change named fields on ONE existing card. Returns the response.
+
+        PUT /scheduler/v2/schedulers/{board}/shifts, body [{shiftId, ...changed}].
+
+        SENDS ONLY WHAT CHANGES, because v2 MERGES -- proved on 2026-10-07 with a
+        canary: a card was given a distinctive title, then sent a body carrying
+        only `color`, and the title came back intact.
+
+        It used to send the card back whole, on the assumption that PUT replaces.
+        That was wrong twice over. It was unnecessary, and it was actively broken:
+        a real card carries `locationData` derived from its Job, and v2 refuses it
+        with error_code 1004, "can't set locat...". Every update against a real
+        Austin or Chris Test card failed that way, while the probe reported the
+        call working -- the probe's card had no jobId, so it had no location to
+        set. Sending only the changed fields cannot hit a rejected field, and
+        cannot drop a note or a task the team added, because neither is sent.
+
+        v2, because v1 cannot: every card this system makes is an open shift, and
+        v1 refuses those with "can't edit root open shift" whatever the open-spot
+        count.
+        """
+        sid = self.update_id(shift)
+        if not sid:
+            raise ConnecteamError("cannot update a card with no id")
+        # The standing rule, checked against the card as the BOARD has it: a card
+        # somebody is on is not ours to move.
+        assert_unassigned([shift])
+        # And nothing we send may put anybody on it. Belt and braces, since the
+        # body no longer passes through assert_unassigned itself.
+        bad = [k for k in fields
+               if "user" in k.lower() or "assign" in k.lower()]
+        if bad:
+            raise ValueError(
+                f"refusing to send {bad} on a card update; a card is never "
+                f"assigned to a person by this system")
+        return self._request(
+            "PUT", f"/scheduler/v2/schedulers/{scheduler_id}/shifts",
+            body=[{"shiftId": sid, **fields}])
+
+    def apply_card_plan(self, scheduler_id: str, updates, greys, stale_color=None,
+                        live: bool = False, job_names=None) -> tuple:
+        """Carry out the move/recolour half of a plan. (done, failed).
+
+        Creates are left to create_shifts, which already knows how to batch them.
+        """
+        # ONLY the fields that actually differ. `updates` carries the whole
+        # desired payload, and sending that as the change set sent isOpenShift,
+        # openSpots and assignedUserIds along with it -- which the guard in
+        # update_shift refused outright, correctly, on 2026-10-07. The diff is
+        # the authority on what moved; the payload is only where the new values
+        # are read from.
+        acts = [(s, {k: p[k] for k in d if k in p}, d) for s, p, d in updates]
+        for s in greys:
+            acts.append((s, {"color": stale_color},
+                         {"color": (s.get("color"), stale_color)}))
+        if not acts:
+            print(f"   scheduler {scheduler_id}: no card on the board needs "
+                  f"moving or recolouring.")
+            return [], []
+
+        n_move = sum(1 for _s, _f, d in acts
+                     if "startTime" in d or "jobId" in d)
+        n_grey = len(greys)
+        verb = "WOULD change" if not live else "changing"
+        print(f"   scheduler {scheduler_id}: {verb} {len(acts)} card(s) "
+              f"({n_move} moved, {n_grey} no booking claims any more)"
+              + ("." if live else ". Nothing was sent."))
+        for shift, fields, diff in acts:
+            how = ", ".join(f"{k} {a} -> {b}" for k, (a, b) in sorted(diff.items()))
+            shown = dict(shift)
+            shown.update(fields)
+            print(f"     {_fmt(shown, job_names)}")
+            print(f"       {how}")
+        if not live:
+            return [], []
+
+        done, failed = [], []
+        for shift, fields, _diff in acts:
+            try:
+                self.update_shift(scheduler_id, shift, fields)
+            except ConnecteamError as e:
+                print(f"     !! {self.update_id(shift)}: {str(e)[:150]}")
+                failed.append(shift)
+                continue
+            done.append((shift, fields))
+
+        # Read the board back. An accepted request is not a changed card -- the
+        # Sheets half of this project lost days to that distinction, and a POST in
+        # shift_update_probe returned 200 and did nothing at all.
+        # The window has to span where each card WAS and where it was sent. A
+        # moved card is no longer near its old time, and a read-back that looks
+        # only there reports "vanished from the board" for a move that worked --
+        # which is what happened on 2026-10-07 and sent me looking for the wrong
+        # bug.
+        stamps = []
+        for shift, fields in done:
+            for k in ("startTime", "endTime"):
+                stamps.append(int(shift.get(k) or 0))
+                if k in fields:
+                    stamps.append(int(fields[k] or 0))
+        stamps = [t for t in stamps if t]
+        lo = (min(stamps) - 86400) if stamps else 0
+        hi = (max(stamps) + 86400) if stamps else 0
+        after = {str(x.get("id")): x for x in
+                 (self.existing_shifts(scheduler_id, lo, hi) if done else [])}
+        stuck = []
+        for shift, fields in done:
+            got = after.get(str(shift.get("id")))
+            if got is None:
+                stuck.append((shift, "vanished from the board"))
+                continue
+            for k, v in fields.items():
+                a, b = got.get(k), v
+                same = (int(a or 0) == int(b or 0)) if k in ("startTime", "endTime")                     else str(a or "").upper() == str(b or "").upper()
+                if not same:
+                    stuck.append((shift, f"{k} is still {a!r}, wanted {b!r}"))
+                    break
+        print(f"   scheduler {scheduler_id}: {len(done) - len(stuck)} of "
+              f"{len(acts)} card(s) changed, confirmed by reading the board back.")
+        if stuck:
+            print(f"   !! {len(stuck)} card(s) were ACCEPTED but did not change:")
+            for shift, why in stuck:
+                print(f"      {self.update_id(shift)}: {why}")
+        return done, failed + [s for s, _w in stuck]
+
+    def recolour_shift(self, scheduler_id: str, shift: dict, color: str) -> dict:
+        """Repaint ONE existing card. Returns the response; caller verifies.
+
+        PUT /scheduler/v2/schedulers/{board}/shifts, body [{shiftId, ...}].
+
+        v2, because v1 cannot do it: every card this system makes is an open
+        shift, and v1 refuses those with "can't edit root open shift" whatever
+        the open-spot count. Both facts were found by probing, not reading docs.
+
+        The card is sent back WHOLE with one field changed, the way job_share
+        writes a Job back, because this is a replace and anything left out is a
+        field volunteered for deletion.
+        """
+        return self.update_shift(scheduler_id, shift, {"color": color})
+
+    def create_shifts(self, scheduler_id: str, shifts: list[dict],
+                      live: bool = False, skip_existing: bool = True,
+                      job_names=None, draft: bool = False) -> list[dict]:
+        """Create shifts on one board. Returns what was created (empty when not live).
+
+        `live=False` -- the default, and the whole point -- prints what would be sent
+        and touches nothing. Nobody should be able to reach the write path by
+        forgetting an argument.
+
+        `draft=True` posts isPublished: false, so a card lands in the DRAFT layer
+        and no crew sees it until somebody publishes it deliberately.
+
+        Chris, 2026-10-13: "instead of Publishing the cards, save them in Draft
+        form." That is the right default for how the client actually works -- they
+        pull a week out of the draft, assign it, and publish it themselves -- and
+        it means a wrong card costs an editor a minute instead of sending a
+        cleaner across town. isPublished is a real field on every shift the API
+        returns; whether POST HONOURS it is read back and reported, not assumed.
+
+        Deliberately set here, at the POST, and not in the payload the planner
+        builds: draft-ness is a property of how we create a card, not of what the
+        sheet wants, and putting it in the payload would add a field that
+        changes() would have to learn to ignore.
+        """
+        if not shifts:
+            print(f"   scheduler {scheduler_id}: nothing to create.")
+            return []
+
+        # Refuse before the network, not after. This is the standing rule.
+        assert_unassigned(shifts)
+
+        wanted = list(shifts)
+        if skip_existing:
+            lo = min(int(s["startTime"]) for s in wanted)
+            hi = max(int(s["endTime"]) for s in wanted)
+            try:
+                seen = {_shift_key(s) for s in self.existing_shifts(scheduler_id, lo, hi)}
+            except ConnecteamError as e:
+                # Better to stop than to risk doubling a crew's day.
+                raise ConnecteamError(
+                    f"Could not read the board before writing to it, so duplicates "
+                    f"cannot be ruled out: {e}") from e
+            before = len(wanted)
+            wanted = [s for s in wanted if _shift_key(s) not in seen]
+            if before != len(wanted):
+                print(f"   scheduler {scheduler_id}: {before - len(wanted)} job(s) are "
+                      f"already on the board; skipping those.")
+
+        if not live:
+            print(f"   scheduler {scheduler_id}: WOULD create {len(wanted)} job(s)"
+                  f"{' as DRAFT (isPublished false)' if draft else ' PUBLISHED'}. "
+                  f"Nothing was sent.")
+            # Every one of them. This list exists to be checked before anything
+            # becomes real, and a truncated list cannot be checked.
+            for s in wanted:
+                print(f"     {_fmt(s, job_names)}")
+            return []
+
+        created: list[dict] = []
+        for i in range(0, len(wanted), MAX_PER_REQUEST):
+            batch = wanted[i:i + MAX_PER_REQUEST]
+            if draft:
+                batch = [dict(b, isPublished=False) for b in batch]
+            assert_unassigned(batch)      # again, per batch, immediately before the POST
+            body = self._request(
+                "POST", f"/scheduler/v1/schedulers/{scheduler_id}/shifts", body=batch)
+            got = self._rows(body)
+            created.extend(got)
+            print(f"   scheduler {scheduler_id}: created {len(got)} job(s) "
+                  f"({i + len(batch)} of {len(wanted)}).")
+        if draft and created:
+            # Did the API actually honour it? An ignored field would publish
+            # every card to the crews while the log claimed otherwise, which is
+            # the one outcome this flag exists to prevent. Read from the
+            # response, not assumed from the request.
+            states = [bool(c.get("isPublished", True)) for c in created]
+            n_pub = sum(1 for x in states if x)
+            if n_pub:
+                print(f"   !! {n_pub} of {len(created)} card(s) came back "
+                      f"isPublished TRUE despite being posted as draft. The API "
+                      f"did not honour isPublished on create -- those cards ARE "
+                      f"visible to crews.")
+            else:
+                print(f"   all {len(created)} card(s) came back as DRAFT "
+                      f"(isPublished false); no crew sees them yet.")
+        return created
+
+
+# Only the three this system sends. Anything else prints its hex, which is the
+# right answer for a card the team coloured themselves.
+COLOUR_NAMES = {
+    STANDARD_COLOR.upper(): "green",
+    TURNOVER_COLOR.upper(): "BLUE t/o",
+    CANCELLED_COLOR.upper(): "GRAY canc",
+}
+
+
+def _fmt(shift: dict, job_names=None) -> str:
+    """One line per card, for a list somebody has to read before it becomes real.
+
+    `job_names` maps jobId -> the Job's name. Without it the line can only show
+    the title, and since the property moved into the Job field every title reads
+    "Clean" -- a preview of thirty-eight identical lines proves nothing.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(shift.get("timezone", "America/Chicago"))
+    start = datetime.fromtimestamp(int(shift["startTime"]), tz)
+    end = datetime.fromtimestamp(int(shift["endTime"]), tz)
+    jid = str(shift.get("jobId") or "")
+    where = (job_names or {}).get(jid) or (jid[:8] if jid else "(no Job)")
+    # The colour, by name. A preview exists to be checked before anything is
+    # real, and until cancellations went gray there was no way to check a colour
+    # from one: every line looked the same whatever was about to be sent.
+    colour = COLOUR_NAMES.get(str(shift.get("color") or "").upper(), "")
+    return (f"{start:%a %d %b %H:%M}-{end:%H:%M} {shift.get('timezone','')}  "
+            f"{where:<32} {shift.get('title',''):<9} {colour:<10} [Unassigned]")

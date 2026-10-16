@@ -1,0 +1,41 @@
+# --- Secrets / credentials (NEVER commit) ---
+variables.env
+*.env
+.env
+credentials.json
+*_credentials.json
+service_account*.json
+token.json
+*.key
+# Catch-all: no JSON belongs in this repo, and Google SA key files have
+# unpredictable names (e.g. guesty-sheet-sync-<hash>.json). Ignore them all.
+*.json
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Sync automation local artifacts ---
+.guesty_token.json
+sync_output.csv
+
+# --- Data / PII (guest names, confirmation codes) ---
+# Ignore all CSVs by default; keep only the non-PII config lookup.
+*.csv
+!property_to_city.csv
+csvs/
+inputs/*.csv
+
+# --- Local scratch / archives / screenshots ---
+_archive/
+*.png
+*.xlsx
+
+# Personal/scratch files -- not part of the sync
+Invoice *.pdf
+Invoice *.xlsx
+reservation_test.ipynb
+invoice-rci-*.html

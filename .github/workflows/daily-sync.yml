@@ -1,0 +1,299 @@
+name: Daily Guesty -> Sheet sync
+
+# Runs the Guesty pull + merge + Sheet write once a day, early morning Chicago time.
+# GitHub cron is UTC-only and has no DST, so we fire at BOTH 09:00 and 10:00 UTC --
+# 4 AM local in CDT and CST respectively -- and let sync.py decide which one counts.
+#
+# It decides by asking shared state "has today's run happened yet?", NOT by checking
+# whether the clock reads 4. Scheduled workflows are best-effort and can arrive hours
+# late; when they do, an exact-hour check skips every trigger and the job silently
+# never runs. Whichever trigger arrives quillon claims the day; the other stands down.
+on:
+  schedule:
+    # These fire EARLY on purpose. GitHub runs scheduled workflows on a shared
+    # best-effort queue, and over 30 observed triggers the quillon one each day
+    # arrived a median of 4h10m late (range 3h14m - 5h38m). Asking for 4 AM
+    # therefore delivered about 8:10 AM, every day.
+    #
+    # The delay is consistent enough to aim off: 04:47 UTC plus the usual lag
+    # lands close to 4 AM Chicago. The minutes are deliberately NOT :00 -- that
+    # is the most contended slot on the platform, when every cron everywhere
+    # fires at once.
+    #
+    # MEASURED 2026-09-24, the last fifteen scheduled runs: GitHub delivered
+    # every single one LATE, by 82 to 416 minutes. Not one arrived on time. So
+    # the hour a cron names is close to meaningless here; what matters is how
+    # many independent chances there are for one to land inside the window.
+    #
+    # Chris needs the sheet built by 6:45 AM Chicago, no exceptions. These fire
+    # every half hour from 05:03 to 12:33 UTC, which is 00:03-07:33 Chicago in
+    # summer and 23:03-06:33 in winter -- a fixed UTC cron cannot track the
+    # daylight-saving switch, so the band is deliberately wide enough to cover
+    # both. Half-hourly because the delivery lag dwarfs any finer granularity.
+    #
+    # They cost almost nothing: sync.py asks shared state whether today's run
+    # has already happened, so the QUILLON to arrive does the work (~90s) and
+    # every other stands down in about twenty seconds.
+    #
+    # Two of the four crons this replaces were 23:47 and 00:19 Chicago -- both
+    # OUTSIDE the gate's 01:00-12:00 window, so they stood down every day on
+    # arrival. The schedule only worked because GitHub was late enough to push
+    # them into the window by accident.
+    #
+    # This improves the odds; it does not guarantee the deadline. GitHub's
+    # scheduler is best-effort and the fifteen samples above show what that
+    # means in practice. A punctual external trigger is the only way to promise
+    # 6:45, and is tracked separately.
+    # The floor matters more than the ceiling. Landing time is roughly cron
+    # time plus GitHub's lag, so the EARLIEST cron sets the earliest possible
+    # landing -- and 2026-09-24, the quillon night of the wider band, landed at
+    # 06:02 Chicago, the latest of the thirteen good days. The band had been
+    # widened but its floor raised from 04:47 to 05:03 UTC.
+    #
+    # These run ahead of it. Delivered on time they fall before the gate's
+    # 01:00 Chicago window and stand down costing nothing; delivered late --
+    # which is the norm -- they land exactly as the window opens.
+    - cron: "3 2 * * *"
+    - cron: "33 2 * * *"
+    - cron: "3 3 * * *"
+    - cron: "33 3 * * *"
+    - cron: "3 4 * * *"
+    - cron: "33 4 * * *"
+    - cron: "3 5 * * *"
+    - cron: "33 5 * * *"
+    - cron: "3 6 * * *"
+    - cron: "33 6 * * *"
+    - cron: "3 7 * * *"
+    - cron: "33 7 * * *"
+    - cron: "3 8 * * *"
+    - cron: "33 8 * * *"
+    - cron: "3 9 * * *"
+    - cron: "33 9 * * *"
+    - cron: "3 10 * * *"
+    - cron: "33 10 * * *"
+    - cron: "3 11 * * *"
+    - cron: "33 11 * * *"
+    - cron: "3 12 * * *"
+    - cron: "33 12 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (fetch + merge, but do NOT write to the sheet)"
+        type: boolean
+        default: true
+      as_scheduled:
+        description: "Treat this as the DAILY run: check out `live`, claim the day so the crons stand down, obey SYNC_LIVE. Used by the external scheduler."
+        type: boolean
+        default: false
+      repair_shifted_tabs:
+        description: "One-off repair: CLEAR tabs stuck on the old shifted layout and rebuild them from Guesty"
+        type: boolean
+        default: false
+      repair_strikes:
+        description: "One-off repair: IGNORE the strikethrough on each tab and re-derive every cancellation from Guesty"
+        type: boolean
+        default: false
+      delete_out_of_scope:
+        description: "Cleanup: DELETE rows for cities this sheet does not cover (Boston, Nashville, ...) instead of only listing them"
+        type: boolean
+        default: false
+      collapse_duplicates:
+        description: "Cleanup: collapse repeated copies of the same booking into one row (ticks are kept)"
+        type: boolean
+        default: false
+      push_cards:
+        description: "Also raise Connecteam job cards on the Chris Test board after the sheet is written"
+        type: boolean
+        default: true
+      lookback_days:
+        description: "Days of history to fetch (blank = the usual 1). Raise it for a strike repair, or cancellations older than this lose their line."
+        type: string
+        default: ""
+
+concurrency:
+  group: guesty-sheet-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # The nightly run uses the commit tagged `live`, NOT whatever is on hawthorne.
+      #
+      # Three times in September a push of mine reached this job the same night and
+      # broke it: a credential regression on the 4th, a NameError on the 8th that
+      # killed both triggers, and unbatched writes on the 11th. Each passed the test
+      # suite and each was found by the sync failing at 4 AM.
+      #
+      # Moving `live` is now a deliberate act, so hawthorne can be worked on freely:
+      #     git tag -f live <commit> && git push -f origin live
+      #
+      # A manual dispatch can still run any ref, which is how a fix gets verified
+      # before the tag moves.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ (github.event_name == 'schedule' || github.event.inputs.as_scheduled == 'true') && 'live' || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-sync.txt
+
+      - name: Guard - only proceed at 4 AM America/Chicago (manual runs always proceed)
+        id: guard
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.as_scheduled }}" != "true" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch -> proceeding."
+          else
+            # Always proceed to sync.py on a schedule. It asks shared state whether
+            # today's run has already happened (--scheduled / daily_gate.py) instead
+            # of demanding the clock read exactly 4 AM.
+            #
+            # The old exact-hour check assumed the trigger arrives on time. It does
+            # not: on 2026-09-01 both triggers arrived over four hours late, read
+            # Chicago hours 8 and 9, and were both skipped -- so the nightly sync had
+            # never once run from the schedule, and said nothing about it.
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "Scheduled trigger -> handing the once-a-day decision to sync.py."
+          fi
+
+      # The Guesty token now lives in Cloud Storage (STATE_BUCKET), shared with any
+      # other runtime on this account. The actions/cache step that used to sit here
+      # is deliberately gone: two caches would drift, this run would keep reviving a
+      # stale local token on its own schedule, and each runtime would end up minting
+      # separately -- the exact quota exhaustion the shared cache exists to prevent.
+      - name: Run sync
+        if: steps.guard.outputs.run == 'yes'
+        env:
+          GUESTY_CLIENT_ID: ${{ secrets.GUESTY_CLIENT_ID }}
+          GUESTY_CLIENT_SECRET: ${{ secrets.GUESTY_CLIENT_SECRET }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          WORKSHEET_NAME: ${{ vars.WORKSHEET_NAME }}
+          TEMPLATE_TAB: ${{ vars.TEMPLATE_TAB }}
+          SYNC_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || vars.SYNC_LOOKBACK_DAYS }}
+          SYNC_LOOKAHEAD_DAYS: ${{ vars.SYNC_LOOKAHEAD_DAYS }}
+          SYNC_STATUSES: ${{ vars.SYNC_STATUSES }}
+          SYNC_MARK_CANCELLED: ${{ vars.SYNC_MARK_CANCELLED }}
+          # Diagnostic escape hatches. Both are unset in normal operation.
+          #   SYNC_FIELDS_MODE=paths   ask Guesty for dotted field paths
+          #   SYNC_LISTING_CITIES=1    resolve City from /listings instead of the CSV
+          SYNC_FIELDS_MODE: ${{ vars.SYNC_FIELDS_MODE }}
+          SYNC_LISTING_CITIES: ${{ vars.SYNC_LISTING_CITIES }}
+          # Shared state bucket. Unset falls back to the on-disk token cache, which
+          # on an ephemeral runner means minting a token every run.
+          STATE_BUCKET: ${{ vars.STATE_BUCKET }}
+          # Manual dispatch only. On a scheduled run this expands to "" and sync.py
+          # treats a blank value as unset, so the daily job can never clear a tab.
+          SYNC_REPAIR_SHIFTED_TABS: ${{ github.event.inputs.repair_shifted_tabs }}
+          SYNC_REPAIR_STRIKES: ${{ github.event.inputs.repair_strikes }}
+          SYNC_DELETE_OUT_OF_SCOPE: ${{ github.event.inputs.delete_out_of_scope }}
+          SYNC_COLLAPSE_DUPLICATES: ${{ github.event.inputs.collapse_duplicates }}
+        shell: bash
+        run: |
+          # Decide dry-run vs live:
+          #  - Manual run (workflow_dispatch): honour the dry_run checkbox.
+          #  - Scheduled run: LIVE only if the repo variable SYNC_LIVE == 'true'
+          #    (the safety toggle). Until you set it, the daily 4 AM run stays a
+          #    dry-run and never writes your sheet.
+          DRY=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.as_scheduled }}" != "true" ]; then
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then DRY="--dry-run"; fi
+          else
+            if [ "${{ vars.SYNC_LIVE }}" != "true" ]; then
+              DRY="--dry-run"
+              echo "::notice::SYNC_LIVE is not 'true' -> scheduled run stays in DRY-RUN (safety toggle ON). Set repo variable SYNC_LIVE=true to enable live writes."
+            fi
+          fi
+          if [ -n "$DRY" ]; then
+            echo "DRY-RUN mode: the Google Sheet will NOT be modified."
+          else
+            echo "LIVE mode: the Google Sheet WILL be updated."
+          fi
+          # --scheduled makes sync.py claim the day in shared state, so every
+          # other trigger that morning stands down. The external scheduler MUST
+          # land here too, or Cloud Scheduler and GitHub's crons would each run
+          # a full sync.
+          SCHED=""
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ github.event.inputs.as_scheduled }}" = "true" ]; then
+            SCHED="--scheduled"
+          fi
+          # -u keeps stdout unbuffered so the log reads in the order things
+          # actually happened. Today's traceback printed ABOVE the output that
+          # preceded it, which makes a failure far harder to read than it is.
+          python -u sync.py $DRY $SCHED
+
+      # Raise the Connecteam cards straight after the sheet is written.
+      #
+      # THE NIGHTLY STAYS ON CHRIS TEST, even though Austin was signed off for
+      # live writes on 2026-10-07. Those are two different things: Austin's quillon
+      # cards are a deliberate, watched push, and an automatic job is not the
+      # place to find out whether the day went well. This step passes --test, so
+      # it cannot reach a crew board however it is invoked; moving the nightly
+      # onto a market board is a later, separate decision.
+      #
+      # NOT on the 22 scheduled crons. Only one of them actually syncs -- the rest
+      # ask shared state, find the day already claimed, and stand down -- so
+      # running this on every one would push 22 times a day and fill the log with
+      # 21 no-ops that hide the real one. The dispatch is the trigger that does
+      # the day's work (Cloud Scheduler sends it, punctually, in Chicago time),
+      # so the cards follow that.
+      #
+      # If a dispatch is ever missed and a cron does the sync instead, the cards
+      # are simply a day late and the next run fixes them. That is a property of
+      # the push being a RECONCILE and not an append: it makes the board match the
+      # sheet for the window, so a skipped day heals itself rather than
+      # accumulating.
+      #
+      # Austin only. It is the one market with a Job for every property; the other
+      # two boards are 22 and 27 vauxbridge short, and a property with no Job
+      # produces no card at all, silently. Pushing them now would build a board
+      # that looks complete and is not.
+      - name: Raise Connecteam cards (Chris Test board only)
+        if: >-
+          steps.guard.outputs.run == 'yes'
+          && github.event_name == 'workflow_dispatch'
+          && github.event.inputs.push_cards == 'true'
+        env:
+          CONNECTEAM_API_KEY: ${{ secrets.CONNECTEAM_API_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+        run: |
+          # The workflow file and the CODE come from different places, and they
+          # drift. GitHub takes this file from the dispatch ref, but the checkout
+          # above pins `live` whenever as_scheduled is set -- so a step added to
+          # hawthorne today can run against code tagged weeks ago.
+          #
+          # That is not hypothetical: when this step was written, `live` was 62
+          # commits behind, and running it there would have pushed cards in the
+          # OLD turnover colour with no window and no reconcile, on a board Chris
+          # was about to show the team.
+          #
+          # So the step asks the checked-out code whether it is the code this step
+          # was written for, and stands down if it is not. --days exists only in
+          # the version that reconciles; its absence means `live` has not caught up.
+          if ! python connecteam_push.py --help 2>/dev/null | grep -q -- "--days"; then
+            echo "::warning::Connecteam push SKIPPED: the checked-out code predates"
+            echo "::warning::the rolling window (no --days). Move the \`live\` tag to"
+            echo "::warning::ship it: git tag -f live <commit> && git push -f origin live"
+            echo "Checked-out ref does not support the rolling window; nothing sent."
+            exit 0
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Sheet run was a DRY RUN, so the cards are previewed only."
+            python -u connecteam_push.py --city Austin --test
+          else
+            python -u connecteam_push.py --city Austin --test --live
+          fi
+
+      - name: Upload output snapshot
+        if: steps.guard.outputs.run == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-output
+          path: sync_output.csv
+          if-no-files-found: ignore

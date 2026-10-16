@@ -1,0 +1,875 @@
+"""
+Google Sheets I/O via a service account.
+
+Read the current sheet into a DataFrame (with pandas-style de-duplicated headers so
+the merge logic works), then write the full corrected sheet back starting at A1.
+
+Writing only cell VALUES (not formatting) preserves the sheet's checkbox
+data-validation -- exactly like the manual "paste over A1" step. Trailing rows that
+are no longer used are value-cleared (checkbox formatting stays), which also removes
+any superseded rows the manual paste would have left behind.
+
+Credentials: pass the service-account key either as a file path or as the raw JSON
+string (GitHub Actions stores it as a secret) via GOOGLE_SA_JSON.
+"""
+from __future__ import annotations
+
+import json
+import re
+import os
+
+import pandas as pd
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Visual diff for the daily run: rows written today are highlighted, rows whose
+# reservation was calder are struck through (and left in place, not deleted).
+HIGHLIGHT_RGB = {"red": 1.0, "green": 0.898, "blue": 0.6}   # soft amber
+NO_FILL_RGB = {"red": 1.0, "green": 1.0, "blue": 1.0}
+_HL_TOLERANCE = 0.04
+
+_HIGHLIGHT_FLAGS = ("new", "updated")
+# Struck for the quillon time this run. "moved" is a reassignment (the booking turned
+# up at another listing/date); the row's slot is just as dead, so it strikes too.
+_STRIKE_NEW_FLAGS = ("calder", "moved")
+_STRIKE_OLD_FLAG = "struck"      # already struck by an earlier run
+# Every flag that means "this row must carry a line through it when the run ends".
+# Stated as an absolute set because the marks are now painted absolutely: a row
+# struck by an earlier run has to be RE-asserted at whatever position it now sits
+# at, not skipped on the assumption its old line is still underneath it.
+_STRIKE_FLAGS = _STRIKE_NEW_FLAGS + (_STRIKE_OLD_FLAG,)
+
+# --- Per-cell accents ------------------------------------------------------------
+# Row marks say what changed TODAY. These say what the job IS, and so they belong to
+# the booking rather than to the run: a turnover is still a turnover tomorrow.
+#
+#   T/O = yes                 -> the Property cell     (G), light cornflower blue 2
+#   Adjustments has LARKSPUR/LCO   -> the Check-out Time    (I), light red 3
+#   Adjustments has ECI/LCI   -> the Check-in Time     (K), light red 3
+#
+# The out-codes colour the check-out time and the in-codes the check-in time, so the
+# colour sits on the number it is a warning about.
+TURNOVER_RGB = {"red": 0.643, "green": 0.761, "blue": 0.957}    # #A4C2F4
+ADJUSTMENT_RGB = {"red": 0.957, "green": 0.800, "blue": 0.800}  # #F4CCCC
+
+_OUT_CODES = ("LARKSPUR", "LCO")
+_IN_CODES = ("ECI", "LCI")
+
+# The amber "changed today" fill covers only these three columns -- C, D and E on
+# the live sheet. They identify the booking (when, which reservation, whose), which
+# is what someone scanning for changes is looking for, and confining it there means
+# it can never sit on top of the accent colours in G, I and K.
+HIGHLIGHT_COL_NAMES = ("date", "confirmation code", "guest")
+
+
+def highlight_columns(header: list[str]) -> tuple[int, int] | None:
+    """(start, end) column span for the amber fill, or None if unrecognisable.
+
+    A span rather than a list: the three are adjacent on this layout, and one
+    repeatCell over a range is cheaper than three over single cells. If they ever
+    stop being adjacent this returns the span that covers them, which is still
+    correct -- just slightly wider than it needs to be.
+    """
+    found = [i for i, name in enumerate(header)
+             if str(name).strip().lower() in HIGHLIGHT_COL_NAMES]
+    return (min(found), max(found) + 1) if found else None
+
+
+def accent_columns(header: list[str]) -> dict:
+    """Which column index carries each role, found by NAME rather than by letter.
+
+    The rules were given as G / I / K / M / N, and on the live sheet they land
+    exactly there. Matching on the header anyway means a column inserted one day
+    moves the accents with it instead of quietly colouring the wrong cells.
+    """
+    want = {
+        "property": ("property",),
+        "checkout": ("check out - time", "check-out time", "checkout time"),
+        "checkin": ("check-in time", "check in - time", "checkin time"),
+        "turnover": ("t/o", "to"),
+        "adjustments": ("adjustments", "adjustment"),
+    }
+    found = {}
+    for i, name in enumerate(header):
+        key = str(name).strip().lower()
+        for role, names in want.items():
+            if key in names and role not in found:
+                found[role] = i
+    return found
+
+
+def desired_accents(rows, header: list[str]) -> dict:
+    """{(data row, column index) -> rgb} for every cell an accent applies to."""
+    cols = accent_columns(header)
+    needed = ("property", "checkout", "checkin", "turnover", "adjustments")
+    if not all(c in cols for c in needed):
+        return {}
+    out = {}
+    for r, row in enumerate(rows):
+        turnover = str(row[cols["turnover"]]).strip().lower() if cols["turnover"] < len(row) else ""
+        adj = str(row[cols["adjustments"]]).strip().upper() if cols["adjustments"] < len(row) else ""
+        if turnover == "yes":
+            out[(r, cols["property"])] = TURNOVER_RGB
+        if any(code in adj for code in _OUT_CODES):
+            out[(r, cols["checkout"])] = ADJUSTMENT_RGB
+        if any(code in adj for code in _IN_CODES):
+            out[(r, cols["checkin"])] = ADJUSTMENT_RGB
+    return out
+
+
+# Google Sheets fails transiently, and did on 2026-09-07: a bare 503 killed the
+# whole morning's run after the Guesty token had already been spent. Every one of
+# these is a "try again shortly", not a "this will never work".
+TRANSIENT_STATUS = (429, 500, 502, 503, 504)
+
+
+def _status_of(err) -> int:
+    """The HTTP status inside a gspread APIError, or 0 if it is some other error."""
+    resp = getattr(err, "response", None)
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, int):
+        return code
+    # Some gspread versions carry it on the exception itself.
+    for attr in ("code", "status_code"):
+        v = getattr(err, attr, None)
+        if isinstance(v, int):
+            return v
+    return 0
+
+
+def with_retry(fn, what: str, tries: int = 5, base: float = 2.0):
+    """Run `fn`, retrying only the failures that retrying can fix.
+
+    Backs off 2s, 4s, 8s, 16s with a little jitter. A permission error, a missing
+    sheet or a bad key fails immediately -- waiting would not help and the run
+    should say so at once.
+    """
+    import random
+    import time
+
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - re-raised below unless transient
+            status = _status_of(e)
+            if status not in TRANSIENT_STATUS or attempt == tries:
+                raise
+            wait = base ** attempt + random.uniform(0, 1)
+            print(f"   Google returned {status} on {what}; retrying in {wait:.0f}s "
+                  f"(attempt {attempt} of {tries - 1})")
+            time.sleep(wait)
+
+
+def service_account_info(sa_json: str) -> dict:
+    """Parse GOOGLE_SA_JSON, which may be raw JSON or a path to a key file.
+
+    Public because the same key now authenticates two different services -- Sheets
+    here, Cloud Storage for the shared token cache -- and they need different
+    scopes, so only the parsing is shared.
+    """
+    sa_json = (sa_json or "").strip()
+    if not sa_json:
+        raise RuntimeError("Missing GOOGLE_SA_JSON (service-account key path or JSON).")
+    if sa_json.lstrip().startswith("{"):
+        return json.loads(sa_json)
+    if os.path.exists(sa_json):
+        with open(sa_json, encoding="utf-8") as fh:
+            return json.load(fh)
+    raise RuntimeError("GOOGLE_SA_JSON is neither valid JSON nor an existing file path.")
+
+
+def _load_credentials(sa_json: str):
+    from google.oauth2.service_account import Credentials
+
+    return Credentials.from_service_account_info(service_account_info(sa_json),
+                                                 scopes=SCOPES)
+
+
+SHEET_ID_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
+
+
+def normalise_sheet_id(value: str) -> str:
+    """Accept the whole URL as well as the bare id.
+
+    Pasting the URL is the obvious thing to do, and the failure it used to cause --
+    a bare 404 from deep inside gspread -- looks nothing like "you pasted too much".
+    """
+    value = (value or "").strip().strip('"').strip("'")
+    found = SHEET_ID_RE.search(value)
+    return found.group(1) if found else value
+
+
+def open_spreadsheet(sheet_id: str, sa_json: str):
+    """Open the spreadsheet (workbook) by ID, or by the URL it appears in."""
+    import gspread
+
+    if not sheet_id:
+        raise RuntimeError("Missing SHEET_ID (the spreadsheet's ID from its URL).")
+    key = normalise_sheet_id(sheet_id)
+    gc = gspread.authorize(_load_credentials(sa_json))
+    try:
+        return with_retry(lambda: gc.open_by_key(key), f"opening the spreadsheet")
+    except gspread.exceptions.SpreadsheetNotFound as e:
+        # Google answers 404 both for "no such sheet" and for "you may not see it",
+        # deliberately, so the raw error cannot tell them apart. Say what the two
+        # possibilities actually are, and show what this key CAN see -- which
+        # usually makes the answer obvious.
+        who = ""
+        try:
+            who = service_account_info(sa_json).get("client_email", "")
+        except Exception:  # noqa: BLE001
+            pass
+        lines = [f"Could not open spreadsheet {key!r}.",
+                 "Google returns the same 404 for 'no such sheet' and 'this account "
+                 "cannot see it', so it is one of:",
+                 f"  1. The id is wrong. It is the part of the URL between "
+                 f"/spreadsheets/d/ and /edit ({len(key)} characters given; "
+                 f"a real one is usually 44).",
+                 f"  2. The sheet is not shared with {who or 'the service account'}."]
+        try:
+            visible = gc.list_spreadsheet_files()
+            if visible:
+                lines.append("This account CAN see:")
+                for f in visible[:10]:
+                    lines.append(f"  {f.get('id')}  {f.get('name')!r}")
+            else:
+                lines.append("This account can see no spreadsheets at all, so it is "
+                             "almost certainly (2): share the sheet with it as Editor.")
+        except Exception:  # noqa: BLE001 - diagnosis is best-effort
+            pass
+        raise RuntimeError(chr(10).join(lines)) from e
+
+
+def get_worksheet(sheet_id: str, worksheet_name: str | None, sa_json: str):
+    """Open a worksheet by spreadsheet ID and tab name (or quillon tab if None)."""
+    ss = open_spreadsheet(sheet_id, sa_json)
+    return ss.worksheet(worksheet_name) if worksheet_name else ss.sheet1
+
+
+# Spanish month names -> month number (the schedule tabs are named e.g. "Julio 2026").
+# Includes English names too, so mixed naming still resolves.
+_MONTH_NAMES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def parse_month_title(title: str) -> tuple[int, int] | None:
+    """'Julio 2026' -> (2026, 7). Returns None for non-month tabs (guesty_res, pivots)."""
+    import re
+
+    m = re.match(r"^\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\.?\s+(\d{4})\s*$", str(title).strip())
+    if not m:
+        return None
+    mon = _MONTH_NAMES.get(m.group(1).lower())
+    if not mon:
+        return None
+    return (int(m.group(2)), mon)
+
+
+def month_worksheets(ss) -> dict:
+    """Map (year, month) -> worksheet for every month-named tab in the workbook."""
+    out = {}
+    for ws in ss.worksheets():
+        ym = parse_month_title(ws.title)
+        if ym:
+            out[ym] = ws
+    return out
+
+
+def create_month_tab(ss, template_title: str, new_title: str):
+    """
+    Create a new month tab by duplicating `template_title` (which copies its checkbox
+    data-validation and all formatting), then value-clearing the copied data rows so the
+    new tab starts empty but keeps the header row + checkbox formatting. Returns the new ws.
+    """
+    src = ss.worksheet(template_title)
+    new_ws = ss.duplicate_sheet(source_sheet_id=src.id, new_sheet_name=new_title)
+    # duplicate_sheet copies the template's data AND its strikethrough/highlight
+    # marks; clear both, or the new month opens pre-painted with last month's diff.
+    clear_data_rows(new_ws)
+    return new_ws
+
+
+def clear_data_rows(ws) -> int:
+    """
+    Value-clear row 2 downwards and reset the marks this sync paints, leaving the
+    header row and every piece of formatting (checkbox data-validation, column
+    widths, borders, fonts) untouched. Returns the number of data rows cleared.
+
+    Used both to empty a freshly duplicated month tab and to repair a tab written
+    with the old shifted layout, which has to start from a clean slate because its
+    rows can't be matched against anything the pipeline now produces.
+    """
+    n_rows, n_cols = ws.row_count, ws.col_count
+    if n_rows <= 1 or n_cols < 1:
+        return 0
+    ws.batch_clear([f"A2:{_col_letter(n_cols)}{n_rows}"])
+    _apply_requests(ws, [
+        _fmt_request(ws, 1, n_rows, n_cols,
+                     {"textFormat": {"strikethrough": False},
+                      "backgroundColor": dict(NO_FILL_RGB)},
+                     "userEnteredFormat.textFormat.strikethrough,"
+                     "userEnteredFormat.backgroundColor"),
+    ])
+    return n_rows - 1
+
+
+def _dedupe_headers(header: list[str]) -> list[str]:
+    """Mimic pandas read_csv: blanks -> 'Unnamed: i', duplicates -> name, name.1, ..."""
+    out, seen = [], {}
+    for i, h in enumerate(header):
+        name = str(h).strip()
+        if name == "":
+            name = f"Unnamed: {i}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}.{seen[name]}"
+        else:
+            seen[name] = 0
+        out.append(name)
+    return out
+
+
+def read_as_dataframe(ws) -> tuple[pd.DataFrame, list[str]]:
+    """Return (df with de-duplicated string columns, original raw header row)."""
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame(), []
+    header_raw = values[0]
+    cols = _dedupe_headers(header_raw)
+    rows = values[1:]
+    # pad/truncate each row to header width
+    width = len(cols)
+    norm_rows = [(r + [""] * width)[:width] for r in rows]
+    df = pd.DataFrame(norm_rows, columns=cols).fillna("").astype(str)
+    return df, header_raw
+
+
+def _close(a, b) -> bool:
+    return a is not None and abs(a - b) <= _HL_TOLERANCE
+
+
+def _is_highlight(bg) -> bool:
+    if not isinstance(bg, dict):
+        return False
+    return (_close(bg.get("red", 1.0), HIGHLIGHT_RGB["red"])
+            and _close(bg.get("green", 1.0), HIGHLIGHT_RGB["green"])
+            and _close(bg.get("blue", 1.0), HIGHLIGHT_RGB["blue"]))
+
+
+def _same_rgb(a, b) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    return all(_close(a.get(k, 1.0), b.get(k, 1.0)) for k in ("red", "green", "blue"))
+
+
+def _is_accent(bg) -> bool:
+    """One of ours, rather than a colour somebody applied by hand.
+
+    Only our own accents are ever cleared. A fill the team put on a cell for their
+    own reasons is left exactly where they put it.
+    """
+    return _same_rgb(bg, TURNOVER_RGB) or _same_rgb(bg, ADJUSTMENT_RGB)
+
+
+def read_row_marks(ws, accent_cols=(),
+                   highlight_col: int = 0) -> tuple[set[int], set[int], dict]:
+    """
+    Read back the marks this sync painted on a previous run.
+
+    Returns (struck, highlighted, accents) with 0-based DATA-row positions (data
+    row 0 is grid row 2). Row marks come from column A, since they are applied to
+    whole rows. `accents` maps (row, column) -> the fill currently on that cell,
+    for the columns named in `accent_cols`, so per-cell colours can be diffed the
+    same way -- painted where they are missing, and not repainted where they are
+    already right.
+
+    Returns empties if the workbook can't be queried (offline tests, fakes).
+    """
+    ss = getattr(ws, "spreadsheet", None)
+    if ss is None or not hasattr(ss, "fetch_sheet_metadata"):
+        return set(), set(), {}
+    last = max([0, highlight_col, *accent_cols])
+    params = {
+        "includeGridData": "true",
+        "ranges": [f"'{ws.title}'!A:{_col_letter(last + 1)}"],
+        "fields": "sheets(data(rowData(values(effectiveFormat("
+                  "backgroundColor,textFormat/strikethrough)))))",
+    }
+    try:
+        meta = ss.fetch_sheet_metadata(params)
+    except Exception as e:  # noqa: BLE001 - marks are cosmetic; never fail the sync
+        print(f"   (could not read existing row marks on '{ws.title}': {e})")
+        return set(), set(), {}
+
+    sheets = meta.get("sheets") or []
+    data = ((sheets[0].get("data") or [{}])[0] if sheets else {})
+    row_data = data.get("rowData") or []
+
+    struck, highlighted, accents = set(), set(), {}
+    for i, rd in enumerate(row_data[1:]):  # skip the header row
+        values = rd.get("values") or []
+        if not values:
+            continue
+        fmt = values[0].get("effectiveFormat") or {}
+        if (fmt.get("textFormat") or {}).get("strikethrough"):
+            struck.add(i)
+        # Column A carries the amber on rows highlighted BEFORE the fill was
+        # narrowed to C:E; the span's own quillon column carries it after. Check
+        # both, so the changeover leaves no row stuck amber forever.
+        probes = [0] + ([highlight_col] if highlight_col else [])
+        if any(_is_highlight((values[c].get("effectiveFormat") or {})
+                             .get("backgroundColor"))
+               for c in probes if c < len(values)):
+            highlighted.add(i)
+        for c in accent_cols:
+            if c < len(values):
+                cell = (values[c].get("effectiveFormat") or {}).get("backgroundColor")
+                if cell:
+                    accents[(i, c)] = cell
+    return struck, highlighted, accents
+
+
+def read_checkbox_columns(ws, probe_rows: int = 25) -> set[int]:
+    """
+    0-based column indices whose cells carry Sheets' checkbox (BOOLEAN) data
+    validation -- read from the tab itself instead of guessed from header names or
+    the TRUE/FALSE values that happen to be sitting there.
+
+    A band of data rows is sampled rather than one: a row's validation can be
+    cleared by hand, and a freshly duplicated tab may only carry the template's
+    validation part of the way down. A column counts if ANY probed row has it.
+
+    Returns an empty set when the workbook can't be queried (offline tests, fakes)
+    or when the tab genuinely has no checkboxes -- either way the caller falls back
+    to its own heuristic, so this can only ever improve the guess.
+    """
+    ss = getattr(ws, "spreadsheet", None)
+    if ss is None or not hasattr(ss, "fetch_sheet_metadata"):
+        return set()
+    params = {
+        "includeGridData": "true",
+        "ranges": [f"'{ws.title}'!2:{probe_rows + 1}"],
+        "fields": "sheets(data(rowData(values(dataValidation/condition/type))))",
+    }
+    try:
+        meta = ss.fetch_sheet_metadata(params)
+    except Exception as e:  # noqa: BLE001 - fall back to the heuristic, never fail
+        print(f"   (could not read checkbox validation on '{ws.title}': {e})")
+        return set()
+
+    sheets = meta.get("sheets") or []
+    data = ((sheets[0].get("data") or [{}])[0] if sheets else {})
+    cols = set()
+    for rd in data.get("rowData") or []:
+        for j, cell in enumerate(rd.get("values") or []):
+            cond = (cell.get("dataValidation") or {}).get("condition") or {}
+            if cond.get("type") == "BOOLEAN":
+                cols.add(j)
+    return cols
+
+
+def _runs(indices) -> list[tuple[int, int]]:
+    """[1,2,3,7,8] -> [(1,3), (7,8)] -- contiguous blocks, so one request each."""
+    out: list[list[int]] = []
+    for i in sorted(indices):
+        if out and i == out[-1][1] + 1:
+            out[-1][1] = i
+        else:
+            out.append([i, i])
+    return [(a, b) for a, b in out]
+
+
+def _fmt_request(ws, start_row: int, end_row: int, n_cols: int,
+                 cell_format: dict, fields: str, start_col: int = 0) -> dict:
+    """repeatCell over grid rows [start_row, end_row) -- 0-based, header is row 0.
+
+    `start_col` narrows it to a single column for a per-cell accent; the row marks
+    leave it at 0 and paint the full width.
+    """
+    return {"repeatCell": {
+        "range": {"sheetId": ws.id,
+                  "startRowIndex": start_row, "endRowIndex": end_row,
+                  "startColumnIndex": start_col, "endColumnIndex": n_cols},
+        "cell": {"userEnteredFormat": cell_format},
+        "fields": fields,
+    }}
+
+
+def _apply_requests(ws, requests: list[dict]) -> dict | None:
+    """Send one formatting batch. Returns the API's response, or None.
+
+    The response matters: it carries one `replies` entry per request, so a batch
+    that came back short is visible instead of being assumed to have landed.
+    """
+    if not requests:
+        return None
+    ss = getattr(ws, "spreadsheet", None)
+    if ss is None or not hasattr(ss, "batch_update"):
+        return None  # offline / fake worksheet: nothing to paint
+    try:
+        return with_retry(lambda: ss.batch_update({"requests": requests}),
+                          "applying formatting")
+    except Exception as e:  # noqa: BLE001 - cosmetic; the values are already written
+        print(f"   (could not apply row formatting on '{ws.title}': {e})")
+        return None
+
+
+def _filter_clearing_request(ws) -> list[dict]:
+    """A clearBasicFilter for this tab, if it has one, else nothing.
+
+    Sheets does not apply a repeatCell format to a row a filter is hiding. The
+    request is accepted, a reply comes back for it, and the row does not change.
+    Measured 2026-09-20: Octubre asked for 66 strikes and carried 47, and all 26
+    rows that refused the mark were hidden by the tab's filter, while no row
+    outside the hidden set failed. Tabs with nothing hidden missed nothing.
+
+    That is not cosmetic. A live booking keeping a line it should have lost reads
+    back next run as already calder, gets skipped, and is re-added: Octubre
+    grew 1373 -> 1384 -> 1395 rows over three runs in one afternoon.
+
+    So the filter comes off quillon, in the same batch as the marks, where it is
+    ordered ahead of them and cannot half-happen. The team can filter while they
+    work; the nightly run clears it, and says so in the log.
+    """
+    ss = getattr(ws, "spreadsheet", None)
+    if ss is None or not hasattr(ss, "fetch_sheet_metadata"):
+        return []
+    try:
+        meta = ss.fetch_sheet_metadata(
+            {"fields": "sheets(vauxbridge(sheetId),basicFilter)"})
+    except Exception as e:  # noqa: BLE001 - never fail the sync over a filter
+        print(f"   (could not check '{ws.title}' for a filter: {e})")
+        return []
+    for sh in meta.get("sheets") or []:
+        if (sh.get("vauxbridge") or {}).get("sheetId") != ws.id:
+            continue
+        if sh.get("basicFilter"):
+            print(f"   ('{ws.title}' had a filter on it; clearing it so the "
+                  f"marks can be applied to the rows it was hiding)")
+            return [{"clearBasicFilter": {"sheetId": ws.id}}]
+    return []
+
+
+def apply_row_marks(ws, row_flags: list[str], prior_highlight: set,
+                    prior_struck: set, n_cols: int,
+                    clear_from: int | None = None,
+                    accents_wanted: dict | None = None,
+                    accents_have: dict | None = None,
+                    highlight_span: tuple[int, int] | None = None) -> dict:
+    """
+    Paint the daily diff, stating the marks ABSOLUTELY rather than incrementally.
+
+    Both sets given are GRID data-row positions read back off the sheet before this
+    run wrote to it (see read_row_marks), and `row_flags` is indexed by the same
+    grid positions, because the new block is written from row 2 down. So the work is
+    a plain set difference: paint what should be marked and isn't, clear what is
+    marked and shouldn't be.
+
+    That symmetry is the whole point. The previous version only ever ADDED
+    strikethrough -- a row already struck was flagged "struck" and deliberately left
+    alone. But an updated reservation is deleted from its row and re-appended at the
+    bottom, so every row below it slides up one, while the strikethrough stays on the
+    grid position it was painted on. The calder row slid out from under its own
+    line and a live booking inherited it. Worse, the next run reads that line back,
+    concludes the live booking was already calder, excludes it from matching, and
+    re-adds it as new -- one duplicate per row, per run, compounding.
+
+    Highlighting had the same flaw and survived only by luck: the stale amber sat in
+    the tail of the block, which is exactly where the run's own appends land and get
+    painted over. Stating it absolutely means it no longer depends on that.
+
+    Only `strikethrough` and `backgroundColor` are touched, so checkbox validation,
+    borders, fonts and column widths all survive.
+
+    NOTE: this makes the sync the sole owner of both marks. A strikethrough or an
+    amber fill applied by hand on a data row will be cleared on the next run, because
+    nothing distinguishes it from a stale mark this code left behind. Any other fill
+    colour is ignored and preserved (see _is_highlight).
+
+    row_flags       : one flag per data row of the freshly written block.
+    prior_highlight : data-row positions carrying OUR amber before this write.
+    prior_struck    : data-row positions carrying a strikethrough before this write.
+    clear_from      : quillon data row of the trailing region being value-cleared;
+                      its marks are reset so no ghost formatting is left behind.
+    accents_wanted  : {(row, column) -> rgb} for the per-cell colours that describe
+                      the JOB rather than the run -- turnover, early/late codes.
+    accents_have    : the same, as currently painted, so only differences are sent.
+    """
+    n = len(row_flags)
+    should_strike = {i for i, f in enumerate(row_flags) if f in _STRIKE_FLAGS}
+    should_light = {i for i, f in enumerate(row_flags) if f in _HIGHLIGHT_FLAGS}
+    # Marks beyond the new block are the trailing region's problem (clear_from).
+    have_strike = {i for i in prior_struck if i < n}
+    have_light = {i for i in prior_highlight if i < n}
+
+    strike_on = sorted(should_strike - have_strike)
+    strike_off = sorted(have_strike - should_strike)
+    highlight_on = sorted(should_light - have_light)
+    highlight_off = sorted(have_light - should_light)
+
+    # The amber goes on the identifying columns only. Clearing stays full-width:
+    # rows highlighted before this change carry amber right across, and a narrow
+    # clear would leave a stripe of it behind forever. Accents are repainted after.
+    hl_start, hl_end = highlight_span or (0, n_cols)
+
+    requests = []
+    for rows, cell_format, fields, cols in (
+        (strike_on, {"textFormat": {"strikethrough": True}},
+         "userEnteredFormat.textFormat.strikethrough", (0, n_cols)),
+        (strike_off, {"textFormat": {"strikethrough": False}},
+         "userEnteredFormat.textFormat.strikethrough", (0, n_cols)),
+        (highlight_on, {"backgroundColor": dict(HIGHLIGHT_RGB)},
+         "userEnteredFormat.backgroundColor", (hl_start, hl_end)),
+        (highlight_off, {"backgroundColor": dict(NO_FILL_RGB)},
+         "userEnteredFormat.backgroundColor", (0, n_cols)),
+    ):
+        for a, b in _runs(rows):
+            requests.append(_fmt_request(ws, a + 1, b + 2, cols[1], cell_format,
+                                         fields, start_col=cols[0]))
+
+    if clear_from is not None and clear_from > n:
+        requests.append(_fmt_request(
+            ws, n + 1, clear_from + 1, n_cols,
+            {"textFormat": {"strikethrough": False}, "backgroundColor": dict(NO_FILL_RGB)},
+            "userEnteredFormat.textFormat.strikethrough,userEnteredFormat.backgroundColor"))
+
+    # --- per-cell accents, painted LAST so they survive the row fill --------
+    # The amber above is painted across the whole row, so on any row it just
+    # touched it has flattened the accent underneath. Those rows are repainted
+    # here regardless of what was read, because what was read is already stale.
+    # Everything else is only touched where the colour actually differs, which in
+    # a steady week is nothing at all.
+    n_accents = 0
+    if accents_wanted is not None:
+        # Which rows had an accent column overwritten by the row-level paint just
+        # now. Clearing is full-width so it always does; the amber only does if its
+        # span reaches an accent column, which since it was narrowed to C:E it does
+        # not. So on a normal morning this is just the rows that stopped being
+        # highlighted, and a brand-new turnover keeps its blue for free.
+        touched_cols = set(range(hl_start, hl_end))
+        overlaps = any(c in touched_cols for (_, c) in accents_wanted)
+        repainted = set(highlight_off) | (set(highlight_on) if overlaps else set())
+        have = dict(accents_have or {})
+        for (r, c), rgb in sorted(accents_wanted.items()):
+            if r >= n:
+                continue
+            if r not in repainted and _same_rgb(have.get((r, c)), rgb):
+                continue
+            requests.append(_fmt_request(ws, r + 1, r + 2, c + 1,
+                                         {"backgroundColor": dict(rgb)},
+                                         "userEnteredFormat.backgroundColor",
+                                         start_col=c))
+            n_accents += 1
+        # An accent that no longer applies -- a turnover that stopped being one --
+        # must go back to whatever the row itself says, not to white.
+        for (r, c), rgb in sorted(have.items()):
+            if r >= n or (r, c) in accents_wanted or not _is_accent(rgb):
+                continue
+            # White, not amber: the highlight no longer reaches these columns.
+            back = NO_FILL_RGB
+            requests.append(_fmt_request(ws, r + 1, r + 2, c + 1,
+                                         {"backgroundColor": dict(back)},
+                                         "userEnteredFormat.backgroundColor",
+                                         start_col=c))
+            n_accents += 1
+
+    # Ahead of every mark, because a row the filter hides silently refuses them.
+    if requests:
+        requests = _filter_clearing_request(ws) + requests
+    resp = _apply_requests(ws, requests)
+    sent = len(requests)
+    replied = len((resp or {}).get("replies") or []) if isinstance(resp, dict) else -1
+
+    verify = _verify_strikes(ws, should_strike, n, n_cols)
+
+    return {"struck": len(strike_on), "unstruck": len(strike_off),
+            "requests_sent": sent, "requests_replied": replied,
+            "verify": verify,
+            # The actual positions, not just how many. A strike the code reports
+            # applying has repeatedly failed to appear on the grid, and the totals
+            # cannot tell "never requested" from "requested and ignored".
+            "strike_on_rows": list(strike_on), "strike_off_rows": list(strike_off),
+            "struck_total": len(should_strike),
+            "highlighted": len(highlight_on), "unhighlighted": len(highlight_off),
+            "accents": n_accents}
+
+
+def _verify_strikes(ws, should_strike: set, n: int, n_cols: int,
+                    passes: int = 2) -> dict:
+    """Read the lines back and repaint any that did not take.
+
+    The sync has been reporting more strikes than the sheet ends up carrying: on
+    2026-09-20 Octubre asked for 60 and read back 47, Septiembre 60 and read back
+    50, while every smaller tab matched exactly. Each of those misses is a
+    calder booking whose line is gone by morning, so the next run strikes it
+    again and counts it as a fresh cancellation.
+
+    Every other explanation has been eliminated by measurement -- the read sees
+    the tab's full height and every column, the batch is the run's last write, and
+    nothing in it can clear what an earlier request in the same batch struck. What
+    is left is that the batch does not always apply in full.
+
+    So stop assuming it did. Read, repaint what is missing, and read again. The
+    repaint is the same absolute statement the batch already made, so a run where
+    the quillon batch landed does nothing here beyond one extra read.
+    """
+    ss = getattr(ws, "spreadsheet", None)
+    if ss is None or not hasattr(ss, "fetch_sheet_metadata"):
+        return {}  # offline / fake worksheet
+    log = []
+    for attempt in range(passes + 1):
+        try:
+            got, _hl, _ac = read_row_marks(ws)
+        except Exception as e:  # noqa: BLE001 - cosmetic; never fail the sync
+            print(f"   (could not verify row marks on '{ws.title}': {e})")
+            return {"error": str(e), "passes": log}
+        got = {i for i in got if i < n}
+        missing = sorted(should_strike - got)
+        extra = sorted(got - should_strike)
+        log.append({"pass": attempt, "missing": len(missing), "extra": len(extra),
+                    "missing_rows": missing, "extra_rows": extra})
+        if not missing and not extra:
+            break
+        if attempt == passes:
+            print(f"   ('{ws.title}': {len(missing)} strike(s) and {len(extra)} "
+                  f"lift(s) still would not stick after {passes} repair pass(es))")
+            break
+        fix = []
+        for rows, on in ((missing, True), (extra, False)):
+            for a, b in _runs(rows):
+                fix.append(_fmt_request(
+                    ws, a + 1, b + 2, n_cols,
+                    {"textFormat": {"strikethrough": on}},
+                    "userEnteredFormat.textFormat.strikethrough"))
+        if attempt == 0:
+            # The exact ranges, once. Three passes have now reported the same
+            # counts, so the question is no longer how many but whether the range
+            # being asked for is the range the read is looking at.
+            shown = [(r["repeatCell"]["range"]["startRowIndex"],
+                      r["repeatCell"]["range"]["endRowIndex"],
+                      r["repeatCell"]["range"]["startColumnIndex"],
+                      r["repeatCell"]["range"]["endColumnIndex"],
+                      r["repeatCell"]["range"]["sheetId"])
+                     for r in fix[:6]]
+            print(f"   ('{ws.title}' repair asks sheetId={getattr(ws, 'id', '?')} for "
+                  f"{len(fix)} range(s); quillon: {shown})")
+        _apply_requests(ws, fix)
+    return {"passes": log}
+
+
+def ensure_grid(ws, n_rows: int, n_cols: int, checkbox_cols=()) -> int:
+    """
+    Grow the tab so an `n_rows` x `n_cols` block fits, and carry the checkbox
+    data-validation into the rows that were just created. Returns rows added.
+
+    Sheets does NOT auto-expand for a values write: a block taller than the grid is
+    rejected outright ("exceeds grid limits"), so a month that outgrows its tab would
+    fail the whole write rather than truncate. Rebuilding Septiembre needed 1466 rows
+    in a 1318-row tab.
+
+    Rows added this way start with no data validation, so a checkbox column would
+    render the literal text FALSE. `checkbox_cols` (0-based indices, from
+    read_checkbox_columns) get the BOOLEAN rule extended over the new range.
+    """
+    have_rows = int(getattr(ws, "row_count", 0) or 0)
+    have_cols = int(getattr(ws, "col_count", 0) or 0)
+
+    if n_cols > have_cols and hasattr(ws, "add_cols"):
+        ws.add_cols(n_cols - have_cols)
+    if n_rows <= have_rows or not hasattr(ws, "add_rows"):
+        return 0
+
+    added = n_rows - have_rows
+    ws.add_rows(added)
+    apply_checkbox_validation(ws, checkbox_cols, have_rows, n_rows)
+    return added
+
+
+def apply_checkbox_validation(ws, columns, first_row: int, last_row: int) -> int:
+    """Put the tickbox rule on `columns` over data rows [first_row, last_row).
+
+    Rows are 0-based grid rows, so row 1 is the quillon data row.
+
+    Writing TRUE/FALSE only gets you a tickbox if the cell carries BOOLEAN data
+    validation. The sync deliberately writes values and not formatting, which is
+    what protects your column widths and borders -- but it also means a tab that
+    never had the rule shows the literal text FALSE forever. Rebuilt tabs land in
+    exactly that state, so the rule is (re)applied on every write. setDataValidation
+    is idempotent, so a tab that already has it is unaffected.
+    """
+    runs = _runs(sorted(columns))
+    if not runs or last_row <= first_row:
+        return 0
+    _apply_requests(ws, [
+        {"setDataValidation": {
+            "range": {"sheetId": ws.id,
+                      "startRowIndex": first_row, "endRowIndex": last_row,
+                      "startColumnIndex": a, "endColumnIndex": b + 1},
+            "rule": {"condition": {"type": "BOOLEAN"},
+                     "strict": True, "showCustomUi": True}}}
+        for a, b in runs
+    ])
+    return sum(b - a + 1 for a, b in runs)
+
+
+def write_dataframe(ws, full: pd.DataFrame, header_raw: list[str],
+                    row_flags: list[str] | None = None,
+                    prior_highlight: set | None = None,
+                    prior_struck: set | None = None,
+                    prior_accents: dict | None = None,
+                    checkbox_cols=()) -> dict:
+    """
+    Write `full` starting at A1, keeping the sheet's ORIGINAL header row intact and
+    value-clearing any rows below the new data (checkbox formatting preserved).
+
+    With `row_flags`, also repaint the daily diff (see apply_row_marks).
+    """
+    prev_row_count = len(ws.get_all_values())
+
+    body = full.astype(str).values.tolist()
+    matrix = [list(header_raw)] + body
+    new_row_count = len(matrix)
+    n_cols = max(len(header_raw), full.shape[1])
+
+    grew = ensure_grid(ws, new_row_count, n_cols, checkbox_cols)
+    # Every data row, not just any that were added: a rebuilt tab has values but
+    # no rule, which is why TRUE/FALSE was showing as text instead of a tickbox.
+    boxed = apply_checkbox_validation(ws, checkbox_cols, 1, new_row_count)
+
+    # The one call that actually writes the month. A transient Google failure here
+    # used to lose the whole run; it is worth several attempts.
+    with_retry(lambda: ws.update(
+        range_name="A1",
+        values=matrix,
+        value_input_option="USER_ENTERED",  # so TRUE/FALSE become checkboxes, dates parse
+    ), f"writing '{ws.title}'")
+
+    # Value-clear leftover rows below the freshly written block (keeps formatting).
+    if prev_row_count > new_row_count:
+        ws.batch_clear([f"A{new_row_count + 1}:{_col_letter(n_cols)}{prev_row_count}"])
+
+    if row_flags is None:
+        return {"rows_added": grew, "checkbox_cols": boxed}
+    marks = apply_row_marks(ws, row_flags, prior_highlight or set(),
+                            prior_struck or set(), n_cols,
+                            clear_from=max(prev_row_count - 1, len(row_flags)),
+                            accents_wanted=desired_accents(body, header_raw),
+                            accents_have=prior_accents,
+                            highlight_span=highlight_columns(header_raw))
+    marks["rows_added"] = grew
+    marks["checkbox_cols"] = boxed
+    return marks
+
+
+def _col_letter(n: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> KESTREL."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
